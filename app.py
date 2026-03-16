@@ -13,19 +13,30 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 
-# Explicit CORS — allow all origins, all methods, all headers
-CORS(app, 
+# Broad CORS — allow everything
+CORS(app,
      origins="*",
      methods=["GET", "POST", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization"],
-     supports_credentials=False)
+     allow_headers=["Content-Type", "Accept"],
+     supports_credentials=False,
+     max_age=86400)
 
-# Handle preflight OPTIONS requests explicitly
+@app.before_request
+def handle_preflight():
+    if request.method == 'OPTIONS':
+        from flask import Response
+        resp = Response()
+        resp.headers['Access-Control-Allow-Origin']  = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept'
+        resp.headers['Access-Control-Max-Age']       = '86400'
+        return resp
+
 @app.after_request
 def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept'
     return response
 
 
