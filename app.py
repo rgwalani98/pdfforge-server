@@ -1,0 +1,286 @@
+"""
+PDFForge Server — PyMuPDF-powered PDF editing
+Handles text replacement with exact font, color, and size matching.
+Deploy on Render.com (free tier).
+"""
+
+import fitz  # PyMuPDF
+import base64
+import json
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+app = Flask(__name__)
+
+# Allow requests from any origin (your Cloudflare Pages site)
+# In production, replace "*" with your actual domain e.g. "https://yoursite.com"
+CORS(app, origins="*")
+
+
+@app.route("/", methods=["GET"])
+def health():
+    """Health check — Render pings this to keep the service alive."""
+    return jsonify({"status": "ok", "service": "PDFForge Server"})
+
+
+@app.route("/edit", methods=["POST"])
+def edit_pdf():
+    """
+    Accepts JSON:
+    {
+      "pdf": "<base64-encoded PDF bytes>",
+      "edits": [
+        {
+          "type": "text",
+          "page": 0,
+          "originalText": "Manager",
+          "newText": "Director",
+          "x": 142.5,    // PDF x coordinate (bottom-left origin)
+          "y": 387.2,    // PDF y coordinate (bottom-left origin)
+          "w": 68.4,     // width of original text bbox
+          "h": 18.0      // height of original text bbox
+        },
+        {
+          "type": "highlight",
+          "page": 0,
+          "x": 100, "y": 200, "w": 150, "h": 20
+        },
+        {
+          "type": "redact",
+          "page": 0,
+          "x": 100, "y": 300, "w": 200, "h": 20
+        },
+        {
+          "type": "addtext",
+          "page": 0,
+          "x": 100, "y": 400,
+          "text": "New text",
+          "size": 12,
+          "color": [0, 0, 0]   // RGB 0-1 scale
+        }
+      ]
+    }
+
+    Returns: { "pdf": "<base64-encoded edited PDF>" }
+    """
+    try:
+        data = request.get_json()
+        if not data or "pdf" not in data:
+            return jsonify({"error": "Missing pdf field"}), 400
+
+        # Decode PDF
+        pdf_bytes = base64.b64decode(data["pdf"])
+        edits = data.get("edits", [])
+
+        if not edits:
+            return jsonify({"error": "No edits provided"}), 400
+
+        # Open with PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        for edit in edits:
+            edit_type = edit.get("type", "text")
+            page_num = edit.get("page", 0)
+
+            if page_num >= len(doc):
+                continue
+
+            page = doc[page_num]
+            page_height = page.rect.height
+
+            # ── Convert coordinates ──
+            # Browser sends PDF coords (bottom-left origin, y up)
+            # PyMuPDF uses top-left origin (y down)
+            # Conversion: mupdf_y = page_height - pdf_y - bbox_height
+            x = edit.get("x", 0)
+            y = edit.get("y", 0)
+            w = edit.get("w", 0)
+            h = edit.get("h", 0)
+
+            # Build PyMuPDF rect (top-left origin)
+            rect = fitz.Rect(
+                x,
+                page_height - y - h,
+                x + w,
+                page_height - y
+            )
+
+            if edit_type == "text":
+                new_text = edit.get("newText", "")
+                if not new_text:
+                    continue
+
+                # ── Step 1: Find exact text properties from PDF ──
+                font_name = None
+                font_size = None
+                text_color = None
+
+                # Search for original text in a slightly expanded rect
+                search_rect = rect + (-2, -2, 2, 2)  # expand by 2px each side
+                blocks = page.get_text("dict", clip=search_rect)
+
+                for block in blocks.get("blocks", []):
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            span_text = span.get("text", "").strip()
+                            orig_text = edit.get("originalText", "").strip()
+                            # Match if span contains the original text
+                            if orig_text and (orig_text in span_text or span_text in orig_text):
+                                font_name = span.get("font", None)
+                                font_size = span.get("size", None)
+                                color_int = span.get("color", 0)
+                                # Convert integer color to RGB tuple (0-1 scale)
+                                r = ((color_int >> 16) & 0xFF) / 255.0
+                                g = ((color_int >> 8) & 0xFF) / 255.0
+                                b = (color_int & 0xFF) / 255.0
+                                text_color = (r, g, b)
+                                break
+                        if font_name:
+                            break
+                    if font_name:
+                        break
+
+                # ── Step 2: Sample background color from page ──
+                # Render the page to a small pixmap and sample the bbox area
+                try:
+                    # Render at 2x for better color accuracy
+                    mat = fitz.Matrix(2, 2)
+                    clip = rect + (-1, -1, 1, 1)
+                    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+
+                    # Sample edges of the pixmap to get background
+                    # (center pixels are likely text)
+                    w_px, h_px = pix.width, pix.height
+                    bg_samples = []
+
+                    # Top row, bottom row
+                    for px_x in range(0, w_px, max(1, w_px // 8)):
+                        if h_px > 0:
+                            pixel = pix.pixel(min(px_x, w_px-1), 0)
+                            bg_samples.append(pixel[:3])
+                        if h_px > 1:
+                            pixel = pix.pixel(min(px_x, w_px-1), h_px-1)
+                            bg_samples.append(pixel[:3])
+
+                    if bg_samples:
+                        avg_r = sum(s[0] for s in bg_samples) / len(bg_samples) / 255.0
+                        avg_g = sum(s[1] for s in bg_samples) / len(bg_samples) / 255.0
+                        avg_b = sum(s[2] for s in bg_samples) / len(bg_samples) / 255.0
+                        bg_color = (avg_r, avg_g, avg_b)
+                    else:
+                        bg_color = (1.0, 1.0, 1.0)  # white fallback
+                except Exception:
+                    bg_color = (1.0, 1.0, 1.0)
+
+                # ── Step 3: Cover original text ──
+                page.draw_rect(
+                    rect + (-0.5, -0.5, 0.5, 0.5),
+                    color=bg_color,
+                    fill=bg_color,
+                    overlay=True
+                )
+
+                # ── Step 4: Insert replacement text ──
+                # Use exact font if found, otherwise fallback
+                insert_color = text_color if text_color else (0, 0, 0)
+                insert_size = font_size if font_size else edit.get("fontSizePDF", 12)
+                insert_size = max(4, insert_size * 0.95)
+
+                # Text baseline position in PyMuPDF coords
+                # Insert point = bottom-left of text = top of rect + most of height
+                insert_point = fitz.Point(rect.x0, rect.y1 - rect.height * 0.15)
+
+                if font_name:
+                    try:
+                        # Try to use the exact embedded font
+                        page.insert_text(
+                            insert_point,
+                            new_text,
+                            fontname=font_name,
+                            fontsize=insert_size,
+                            color=insert_color,
+                            overlay=True
+                        )
+                    except Exception:
+                        # Font not available — use best fallback
+                        _insert_with_fallback(page, insert_point, new_text,
+                                              insert_size, insert_color, edit)
+                else:
+                    _insert_with_fallback(page, insert_point, new_text,
+                                          insert_size, insert_color, edit)
+
+            elif edit_type == "highlight":
+                page.draw_rect(rect, color=(1, 0.87, 0), fill=(1, 0.87, 0),
+                               fill_opacity=0.45, overlay=True)
+
+            elif edit_type == "redact":
+                page.draw_rect(rect, color=(0, 0, 0), fill=(0, 0, 0), overlay=True)
+
+            elif edit_type == "addtext":
+                text = edit.get("text", "")
+                size = edit.get("size", 12)
+                color = edit.get("color", [0, 0, 0])
+                point = fitz.Point(x, page_height - y)
+                try:
+                    page.insert_text(point, text, fontsize=size,
+                                     color=tuple(color), overlay=True)
+                except Exception as e:
+                    print(f"addtext error: {e}")
+
+        # Save to bytes
+        out_bytes = doc.tobytes(deflate=True, garbage=3)
+        doc.close()
+
+        # Return as base64
+        result_b64 = base64.b64encode(out_bytes).decode("utf-8")
+        return jsonify({"pdf": result_b64})
+
+    except Exception as e:
+        print(f"Edit error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+def _insert_with_fallback(page, point, text, size, color, edit):
+    """Insert text using best available fallback font."""
+    is_bold = edit.get("isBold", False)
+    is_italic = edit.get("isItalic", False)
+    font_family = edit.get("fontResPdf", "helvetica")
+
+    # Map to PyMuPDF built-in font names
+    if font_family == "times":
+        if is_bold and is_italic:
+            fontname = "tibo"   # Times Bold Italic
+        elif is_bold:
+            fontname = "tibo"   # Times Bold (tibo = Times Bold)
+        elif is_italic:
+            fontname = "tiit"   # Times Italic
+        else:
+            fontname = "tiro"   # Times Roman
+    elif font_family == "courier":
+        fontname = "cobo" if is_bold else "cour"
+    else:
+        # Helvetica family
+        if is_bold and is_italic:
+            fontname = "heob"   # Helvetica Bold Oblique
+        elif is_bold:
+            fontname = "hebo"   # Helvetica Bold
+        elif is_italic:
+            fontname = "heit"   # Helvetica Italic
+        else:
+            fontname = "helv"   # Helvetica
+
+    try:
+        page.insert_text(point, text, fontname=fontname,
+                         fontsize=size, color=color, overlay=True)
+    except Exception:
+        # Last resort — plain helvetica
+        page.insert_text(point, text, fontname="helv",
+                         fontsize=size, color=color, overlay=True)
+
+
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
