@@ -13,9 +13,20 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 
-# Allow requests from any origin (your Cloudflare Pages site)
-# In production, replace "*" with your actual domain e.g. "https://yoursite.com"
-CORS(app, origins="*")
+# Explicit CORS — allow all origins, all methods, all headers
+CORS(app, 
+     origins="*",
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"],
+     supports_credentials=False)
+
+# Handle preflight OPTIONS requests explicitly
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
 
 
 @app.route("/", methods=["GET"])
